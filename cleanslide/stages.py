@@ -1,0 +1,287 @@
+"""The cleaning stages.
+
+Each takes arrays in and returns arrays out. Every size argument is converted 
+from micrometres using the section's own pixel size.
+"""
+import cv2
+import numpy as np
+from scipy import ndimage as ndi
+
+from .params import CleanParams, um_to_px
+
+# Floor for the adaptive dust threshold. Without it, a section with very little
+# dust has a near-zero MAD and would have most of its texture flagged as specks.
+_DUST_MIN_THRESHOLD = 5.0
+
+
+def estimate_background_threshold(gray: np.ndarray, shoulder: float = 0.1) -> int:
+    """Find the grey level separating glass background from tissue.
+
+    The slide background is the dominant bright peak in the histogram. Walk down
+    from its mode until the counts fall to ``shoulder`` of the peak; that is the
+    foot of the background distribution and everything below it is tissue.
+    """
+    hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).ravel()
+    bright = hist[128:]
+    if bright.max() <= 0:
+        return 128
+    mode = 128 + int(np.argmax(bright))
+    floor_count = hist[mode] * shoulder
+    level = mode
+    while level > 1 and hist[level] > floor_count:
+        level -= 1
+    return int(level)
+
+
+def tissue_mask(rgb: np.ndarray, pixel_size_um: float, params: CleanParams):
+    """Binary tissue mask (0 or 255) plus the values estimated along the way."""
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+
+    threshold = estimate_background_threshold(gray)
+    _, coarse = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY_INV)
+
+    # Blur then Otsu: the blur bridges gaps inside tissue so Otsu sees one
+    # foreground region rather than speckle. The kernel is large on purpose.
+    blur_px = um_to_px(params.mask_blur_um, pixel_size_um, odd=True)
+    blurred = cv2.GaussianBlur(coarse, (blur_px, blur_px), 0)
+    _, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    open_px = um_to_px(params.mask_open_um, pixel_size_um)
+    kernel = np.ones((open_px, open_px), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+    info = {
+        "background_threshold": threshold,
+        "mask_blur_px": blur_px,
+        "mask_open_px": open_px,
+        "mask_area_px": int((mask > 0).sum()),
+    }
+    return mask, info
+
+
+def find_bubbles(mask: np.ndarray, pixel_size_um: float, params: CleanParams):
+    """Locate round mounting-medium bubbles as holes enclosed by tissue.
+
+    The hole filling here is a detection step only — the tissue mask returned by
+    :func:`tissue_mask` is never modified.
+    """
+    tissue = mask > 0
+    structure = ndi.generate_binary_structure(2, 2)
+    closed = ndi.binary_closing(tissue, structure=structure)
+    # Pad so a hole touching the border is still enclosed for the fill.
+    padded = np.pad(closed, 1, mode="constant")
+    filled = ndi.binary_fill_holes(padded, structure=structure)[1:-1, 1:-1]
+
+    holes = (filled & ~tissue).astype(np.uint8) * 255
+
+    min_px = um_to_px(params.bubble_min_diameter_um, pixel_size_um)
+    max_px = um_to_px(params.bubble_max_diameter_um, pixel_size_um)
+    min_area = np.pi / 4.0 * min_px ** 2
+    max_area = np.pi / 4.0 * max_px ** 2
+
+    contours, _ = cv2.findContours(holes, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    bubbles = np.zeros_like(holes)
+    kept = 0
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < min_area or area > max_area:
+            continue
+        perimeter = cv2.arcLength(contour, True)
+        circularity = 4 * np.pi * area / (perimeter * perimeter + 1e-6)
+        if circularity < params.bubble_min_circularity:
+            continue
+        cv2.drawContours(bubbles, [contour], -1, 255, -1)
+        kept += 1
+
+    if kept:
+        dilate_px = um_to_px(params.bubble_dilate_um, pixel_size_um, odd=True)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px, dilate_px))
+        bubbles = cv2.dilate(bubbles, kernel, iterations=1)
+
+    info = {
+        "bubbles_found": len(contours),
+        "bubbles_kept": kept,
+        "bubble_area_px": int((bubbles > 0).sum()),
+    }
+    return bubbles, info
+
+
+def inpaint(image: np.ndarray, defect_mask: np.ndarray, pixel_size_um: float,
+            radius_um: float) -> np.ndarray:
+    """Fill the masked region from its surroundings."""
+    if not defect_mask.any():
+        return image
+    radius = um_to_px(radius_um, pixel_size_um)
+    return cv2.inpaint(image, defect_mask, radius, cv2.INPAINT_TELEA)
+
+
+def to_gray(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Grayscale, inverted inside the tissue and zero outside it.
+
+    The inversion is the point of this stage, not a convenience. These sections
+    exist to be registered to a T1 MRI, so the cleaned image should look as much
+    like a T1 as possible: in a T1 white matter is bright, grey matter is darker
+    and the background is dark. Stained histology is the other way round —
+    myelin takes up the stain and reads dark, while the glass background is
+    near-white. Inverting restores the T1 ordering, so the registration's
+    similarity measure compares like with like instead of having to bridge an
+    inverted contrast.
+
+    Only the tissue is inverted. The background is set to zero rather than
+    inverted to white, which also matches a skull-stripped T1.
+    """
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    out = np.zeros_like(gray)
+    inside = mask > 0
+    out[inside] = 255 - gray[inside]
+    return out
+
+
+def to_masked_rgb(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """The colour section with everything outside the tissue set to black.
+
+    Kept alongside the grayscale output as the colour reference: it still shows
+    the stain, which the inverted, normalised grayscale no longer does. Bubbles
+    are already inpainted at this point; dust is not, because dust detection runs
+    on the inverted grayscale where specks are bright.
+    """
+    out = np.zeros_like(rgb)
+    inside = mask > 0
+    out[inside] = rgb[inside]
+    return out
+
+
+def remove_dust(gray: np.ndarray, pixel_size_um: float, params: CleanParams,
+                mask: np.ndarray | None = None):
+    """Remove bright specks smaller than the top-hat structuring element.
+
+    The detection threshold is a multiple of the MAD of the top-hat response, so
+    it follows each section's noise rather than assuming an absolute grey level
+    the way the prototype's hard-coded 25 did.
+
+    The statistics are taken over tissue pixels only. Across the whole frame the
+    zero background dominates — on a section filling half the slide both the
+    median and the MAD collapse to zero, the threshold falls to its floor, and
+    ordinary tissue texture is inpainted as dust.
+    """
+    size = um_to_px(params.dust_tophat_um, pixel_size_um, odd=True)
+    element = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, element)
+
+    sample = tophat[mask > 0] if mask is not None and (mask > 0).any() else tophat
+    median = float(np.median(sample))
+    mad = float(np.median(np.abs(sample - median)))
+    threshold = max(_DUST_MIN_THRESHOLD, median + params.dust_mad_k * 1.4826 * mad)
+
+    specks = (tophat > threshold).astype(np.uint8) * 255
+    if mask is not None:
+        # Never inpaint outside the tissue: the background is flat zero and any
+        # response there is an artefact of the mask edge.
+        specks[mask == 0] = 0
+    cleaned = inpaint(gray, specks, pixel_size_um, params.dust_inpaint_radius_um)
+
+    info = {
+        "dust_tophat_px": size,
+        "dust_threshold": round(threshold, 2),
+        "dust_area_px": int((specks > 0).sum()),
+    }
+    return cleaned, info
+
+
+def normalise_intensity(gray: np.ndarray, mask: np.ndarray, params: CleanParams):
+    """Stretch the tissue to the full range, leaving the background at zero.
+
+    Output brightness otherwise tracks the stain's density rather than the
+    tissue: inverting a pale stain gives a dark, compressed image while a dark
+    stain gives a bright one, so the same settings produce different-looking
+    output per stain. Percentile endpoints keep a handful of extreme pixels from
+    setting the scale.
+    """
+    inside = mask > 0
+    if not inside.any():
+        return gray, {"normalise_low": None, "normalise_high": None}
+
+    values = gray[inside]
+    low, high = np.percentile(values, [params.normalise_low_percentile,
+                                       params.normalise_high_percentile])
+    if high <= low:
+        return gray, {"normalise_low": float(low), "normalise_high": float(high)}
+
+    scaled = (gray.astype(np.float32) - low) * (255.0 / (high - low))
+    out = np.zeros_like(gray)
+    out[inside] = np.clip(scaled[inside], 0, 255).astype(np.uint8)
+
+    return out, {"normalise_low": round(float(low), 2),
+                 "normalise_high": round(float(high), 2)}
+
+
+def suppress_folds(gray: np.ndarray, mask: np.ndarray, pixel_size_um: float,
+                   params: CleanParams) -> np.ndarray:
+    """Delete bright structures narrower than ``fold_open_um``.
+
+    A grayscale opening removes thin bright laminae — tissue folds, and the
+    cerebellar molecular layer — while leaving wide white matter at full
+    brightness. A pointwise curve cannot do this: the molecular layer is brighter
+    than white matter, so no monotonic map can reorder them.
+    """
+    size = um_to_px(params.fold_open_um, pixel_size_um)
+    decimate = max(1, params.fold_decimate)
+
+    source = gray.astype(np.float32).copy()
+    # Background bright during the opening keeps the erosion off the tissue edge.
+    source[mask == 0] = 255.0
+
+    small = cv2.resize(source, None, fx=1.0 / decimate, fy=1.0 / decimate,
+                       interpolation=cv2.INTER_AREA)
+    k = max(3, size // decimate) | 1
+    element = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    small = cv2.morphologyEx(small, cv2.MORPH_OPEN, element)
+
+    opened = cv2.resize(small, (gray.shape[1], gray.shape[0]),
+                        interpolation=cv2.INTER_LINEAR)
+    opened[mask == 0] = 0.0
+    return np.clip(opened, 0, 255).astype(np.uint8)
+
+
+def enhance_clahe(gray: np.ndarray, mask: np.ndarray, pixel_size_um: float,
+                  params: CleanParams) -> np.ndarray:
+    """Local contrast equalisation, applied only inside the tissue.
+
+    Tiles are sized in micrometres. Both prototypes used a fixed 5x5 grid, which
+    silently meant 22 mm tiles on one dataset and 11.7 mm on the other.
+    """
+    tile_px = um_to_px(params.clahe_tile_um, pixel_size_um)
+    height, width = gray.shape[:2]
+    grid = (max(1, width // tile_px), max(1, height // tile_px))
+
+    clahe = cv2.createCLAHE(clipLimit=params.clahe_clip_limit, tileGridSize=grid)
+    equalised = clahe.apply(gray)
+
+    out = gray.copy()
+    inside = mask > 0
+    out[inside] = equalised[inside]
+    return out
+
+
+def enhance_sigmoid(gray: np.ndarray, mask: np.ndarray, params: CleanParams):
+    """S-curve contrast with its centre estimated from the tissue histogram.
+
+    The prototype fixed the centre at 0.52, hand-tuned for one section. Otsu
+    inside the mask finds the same boundary — between white matter and cortex —
+    on any section.
+    """
+    inside = mask > 0
+    if not inside.any():
+        return gray, {"sigmoid_cutoff": None}
+
+    values = gray[inside]
+    cutoff_level, _ = cv2.threshold(values.reshape(-1, 1), 0, 255,
+                                    cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    cutoff = float(cutoff_level) / 255.0
+
+    normalised = gray.astype(np.float32) / 255.0
+    curved = 1.0 / (1.0 + np.exp(-params.sigmoid_gain * (normalised - cutoff)))
+
+    out = np.zeros_like(gray)
+    out[inside] = np.clip(curved[inside] * 255.0, 0, 255).astype(np.uint8)
+    return out, {"sigmoid_cutoff": round(cutoff, 4)}

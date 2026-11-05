@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cleanslide"
+version = "0.1.0.dev0"
+description = "Artifact removal and tissue masking for histology sections"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Sutatip Pittayapong" }]
+keywords = ["histology", "microscopy", "BIDS", "image-processing"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = [
+    "numpy>=1.24",
+    # headless: the pipeline runs on compute nodes with no display, and the GUI
+    # build pulls in X11 libraries that are not there.
+    "opencv-python-headless>=4.8",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+# The QC panel is the only thing needing matplotlib, and batch users do not
+# call it, so it stays out of the core install: pip install cleanslide[qc]
+qc = ["matplotlib>=3.7"]
+test = ["pytest>=7.0"]
+
+[project.scripts]
+cleanslide = "cleanslide.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["cleanslide*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
