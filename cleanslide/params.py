@@ -21,6 +21,43 @@ class CleanParams:
     # Morphological opening that removes speckle outside the section. Too large
     # and thin real tissue is lost; the prototypes settled near 1.1 mm.
     mask_open_um: float = 1100.0
+    # Drop mask components that touch the image edge. Printed calibration charts
+    # and slide labels sit at the edge of the scan and are otherwise read as
+    # tissue: on one section that put a colour chart and a grey step wedge in
+    # the mask, inflating its area and setting the normalisation endpoints from
+    # printed ink. The largest component is always kept, so a section whose own
+    # tissue runs off the frame survives.
+    mask_drop_border_components: bool = True
+    # Drop substantial mask components that nearly fill their own bounding box.
+    # A printed chart bar, scale bar or label block is a filled rectangle by
+    # construction; tissue never is. Measured on one affected section: the brain
+    # scores 0.648 and its temporal lobes 0.51-0.57, against 0.885 for the
+    # chart. Set above 1.0 to disable. The largest component is always kept.
+    # A printed bar is both: tissue is rarely both. Extent alone cannot do it,
+    # because a compact section can reach 0.759 while a chart bar sits at 0.778.
+    # Measured across 16 sections, this pair flags every chart and no tissue;
+    # the closest call is a chart at aspect 1.90 against tissue at 1.52.
+    mask_max_extent: float = 0.70
+    mask_min_aspect: float = 1.7
+    # Only components at least this fraction of the largest are tested for
+    # rectangularity, so ordinary small debris is judged on its own terms.
+    mask_extent_min_area_fraction: float = 0.05
+    # Components smaller than this are never tissue sections: they are slide
+    # labels, grey-wedge fragments and debris. Across the same 16 sections the
+    # distribution is cleanly bimodal - 94 components below 66 mm2, 30 above
+    # 102 mm2, nothing in between. Set to 0 to keep everything.
+    mask_min_component_mm2: float = 100.0
+
+    # ── Cropping ─────────────────────────────────────────────────────────────
+    # Trim the outputs to the tissue's bounding box. A third of a typical slide
+    # is empty glass, so this is both the useful region and a real saving. The
+    # crop origin is recorded in the sidecar, so coordinates map back to the
+    # source scan. Applied after the mask is cleaned up, because the border
+    # filter needs the real image edge.
+    crop_to_tissue: bool = True
+    # Context kept around the tissue. Also keeps it off the crop edge, so the
+    # border diagnostics stay meaningful.
+    crop_margin_um: float = 500.0
 
     # ── Bubble removal ───────────────────────────────────────────────────────
     # Mounting-medium bubbles are round holes in the tissue. Diameter bounds are

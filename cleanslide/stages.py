@@ -33,6 +33,132 @@ def estimate_background_threshold(gray: np.ndarray, shoulder: float = 0.1) -> in
     return int(level)
 
 
+def drop_border_components(mask: np.ndarray):
+    """Remove mask components touching the image edge, keeping the largest.
+
+    Printed calibration charts, grey step wedges and handwritten slide labels
+    sit at the edge of a scan and are as dark as tissue, so a grayscale mask
+    includes them. They are not tissue, and leaving them in corrupts more than
+    the mask: the area measurement counts printed ink, and the intensity
+    normalisation takes its endpoints from a wedge that spans pure white to
+    pure black.
+
+    The largest component is never dropped, so a section whose own tissue runs
+    off the frame is kept rather than deleted.
+    """
+    binary = (mask > 0).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if count <= 1:
+        return mask, 0
+
+    largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    touching = set(np.unique(np.concatenate([
+        labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]])).tolist())
+    touching -= {0, largest}
+    if not touching:
+        return mask, 0
+
+    out = mask.copy()
+    out[np.isin(labels, list(touching))] = 0
+    return out, len(touching)
+
+
+def drop_small_components(mask: np.ndarray, pixel_size_um: float,
+                          min_area_mm2: float):
+    """Remove components too small to be a piece of a tissue section.
+
+    Slide labels, grey-wedge fragments and debris. Across 16 sections the
+    distribution is cleanly bimodal: 94 components below 66 mm2 and 30 above
+    102 mm2, with nothing between, so the threshold does not sit on a cliff.
+    """
+    if min_area_mm2 <= 0:
+        return mask, 0
+
+    binary = (mask > 0).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if count <= 1:
+        return mask, 0
+
+    mm2_per_px = (pixel_size_um * 1e-3) ** 2
+    small = [label for label in range(1, count)
+             if stats[label, cv2.CC_STAT_AREA] * mm2_per_px < min_area_mm2]
+
+    if len(small) == count - 1:
+        # Everything is small, so the threshold is wrong for this section
+        # rather than the section being empty. Keep the largest.
+        largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        small = [label for label in small if label != largest]
+    if not small:
+        return mask, 0
+
+    out = mask.copy()
+    out[np.isin(labels, small)] = 0
+    return out, len(small)
+
+
+def drop_rectangular_components(mask: np.ndarray, max_extent: float,
+                                min_aspect: float = 1.7,
+                                min_area_fraction: float = 0.05):
+    """Remove substantial mask components that nearly fill their bounding box.
+
+    Printed matter on a slide — calibration charts, scale bars, label blocks —
+    is rectangular by construction, while tissue is not. Extent (component area
+    divided by bounding-box area) separates them with room to spare: on the
+    affected section the brain scores 0.648 and its temporal lobes 0.51 and
+    0.57, against 0.885 for the chart.
+
+    Only components at least ``min_area_fraction`` of the largest are tested, so
+    small debris is not judged by a measure that is noisy at that size.
+
+    Rank is deliberately not a defence. An earlier version never dropped the
+    largest component, on the reasoning that it must be the section — but on one
+    slide the chart bar is larger than either hemisphere (1.83 Mpx at extent
+    0.887, against 1.64 and 1.52 Mpx at 0.638 and 0.478), so that rule protected
+    the chart and discarded nothing. Instead every component is judged on shape,
+    and the largest is kept only as a fallback if the test would empty the mask
+    entirely.
+    """
+    if max_extent > 1.0:
+        return mask, 0
+
+    binary = (mask > 0).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if count <= 1:
+        return mask, 0
+
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    largest = 1 + int(np.argmax(areas))
+    threshold_area = areas.max() * min_area_fraction
+
+    printed = []
+    for label in range(1, count):
+        area = stats[label, cv2.CC_STAT_AREA]
+        if area < threshold_area:
+            continue
+        width = stats[label, cv2.CC_STAT_WIDTH]
+        height = stats[label, cv2.CC_STAT_HEIGHT]
+        box = width * height
+        if not box:
+            continue
+        aspect = max(width / height, height / width)
+        # Both tests, not either: a compact section reaches extent 0.759 and an
+        # elongated one reaches aspect 2.5, but only printed bars do both.
+        if area / box > max_extent and aspect > min_aspect:
+            printed.append(label)
+
+    if len(printed) == count - 1:
+        # Everything looks printed, which is far more likely to mean the test is
+        # wrong for this section than that it contains no tissue.
+        printed = [label for label in printed if label != largest]
+
+    if not printed:
+        return mask, 0
+
+    out = mask.copy()
+    out[np.isin(labels, printed)] = 0
+    return out, len(printed)
+
+
 def tissue_mask(rgb: np.ndarray, pixel_size_um: float, params: CleanParams):
     """Binary tissue mask (0 or 255) plus the values estimated along the way."""
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
@@ -50,13 +176,48 @@ def tissue_mask(rgb: np.ndarray, pixel_size_um: float, params: CleanParams):
     kernel = np.ones((open_px, open_px), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
+    dropped = 0
+    if params.mask_drop_border_components:
+        mask, dropped = drop_border_components(mask)
+
+    # After the border pass, so a chart that both touches the edge and is
+    # rectangular is only counted once.
+    mask, printed = drop_rectangular_components(
+        mask, params.mask_max_extent, params.mask_min_aspect,
+        params.mask_extent_min_area_fraction)
+
+    # Last, so the printed bars are gone before the size test runs and cannot
+    # affect what counts as large.
+    mask, small = drop_small_components(mask, pixel_size_um,
+                                        params.mask_min_component_mm2)
+
     info = {
         "background_threshold": threshold,
         "mask_blur_px": blur_px,
         "mask_open_px": open_px,
+        "border_components_dropped": dropped,
+        "printed_components_dropped": printed,
+        "small_components_dropped": small,
         "mask_area_px": int((mask > 0).sum()),
     }
     return mask, info
+
+
+def tissue_bbox(mask: np.ndarray, pixel_size_um: float, margin_um: float):
+    """Bounding box of the tissue as ``(y0, y1, x0, x1)``, or None if empty.
+
+    ``margin_um`` keeps context around the section and, as a side effect, keeps
+    the tissue off the crop edge so the border diagnostics stay meaningful.
+    """
+    rows = np.flatnonzero(mask.any(axis=1))
+    cols = np.flatnonzero(mask.any(axis=0))
+    if not rows.size or not cols.size:
+        return None
+
+    margin = um_to_px(margin_um, pixel_size_um) if margin_um > 0 else 0
+    height, width = mask.shape[:2]
+    return (max(0, int(rows[0]) - margin), min(height, int(rows[-1]) + 1 + margin),
+            max(0, int(cols[0]) - margin), min(width, int(cols[-1]) + 1 + margin))
 
 
 def find_bubbles(mask: np.ndarray, pixel_size_um: float, params: CleanParams):

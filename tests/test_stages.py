@@ -77,6 +77,220 @@ def test_tissue_mask_finds_the_blob_and_excludes_background(section):
     assert 0 < info["mask_area_px"] < mask.size
 
 
+@pytest.fixture
+def section_with_chart():
+    """A slide carrying a printed calibration chart at the bottom edge.
+
+    Two sections in the real set have one; it is as dark as tissue, so a
+    grayscale mask includes it. The gap between tissue and chart is wide
+    compared with the mask blur, as it is on a real slide — otherwise the two
+    merge into a single component and the question does not arise.
+    """
+    rgb = np.full((900, 600, 3), 250, np.uint8)
+    cv2.ellipse(rgb, (300, 280), (200, 220), 0, 0, 360, (150, 130, 170), -1)
+    cv2.ellipse(rgb, (300, 280), (110, 130), 0, 0, 360, (90, 70, 120), -1)
+
+    rng = np.random.default_rng(1)
+    rgb = np.clip(rgb.astype(np.float32) + rng.normal(0, 6, rgb.shape),
+                  0, 255).astype(np.uint8)
+
+    # Spanning the full slide width and running to the bottom edge, as a
+    # printed chart does: that contact with the frame is what identifies it.
+    cv2.rectangle(rgb, (0, 760), (599, 810), (200, 40, 60), -1)    # colour bar
+    cv2.rectangle(rgb, (0, 820), (599, 899), (40, 40, 40), -1)     # grey wedge
+    return rgb
+
+
+def test_calibration_chart_is_dropped_from_the_mask(section_with_chart):
+    chart_point = (840, 300)          # (row, col) inside the printed bars
+
+    with_drop, info = stages.tissue_mask(section_with_chart, PIXEL_SIZE_UM,
+                                         CleanParams())
+    without, _ = stages.tissue_mask(
+        section_with_chart, PIXEL_SIZE_UM,
+        CleanParams(mask_drop_border_components=False, mask_max_extent=1.5,
+                    mask_min_component_mm2=0.0))
+
+    assert without[chart_point] == 255, "chart is masked as tissue without the fix"
+    assert with_drop[chart_point] == 0, "chart must be dropped"
+    assert info["border_components_dropped"] >= 1
+    assert with_drop[280, 300] == 255, "the section itself must survive"
+    assert info["mask_area_px"] < int((without > 0).sum())
+
+
+def test_rectangular_component_is_dropped_but_irregular_tissue_is_kept():
+    """Printed matter fills its bounding box; tissue does not. Measured on the
+    affected section: brain 0.648, temporal lobes 0.51 and 0.57, chart 0.885."""
+    mask = np.zeros((600, 600), np.uint8)
+    cv2.ellipse(mask, (300, 180), (200, 140), 0, 0, 360, 255, -1)   # irregular
+    cv2.rectangle(mask, (100, 420), (500, 520), 255, -1)            # printed bar
+
+    out, dropped = stages.drop_rectangular_components(mask, max_extent=0.80)
+
+    assert dropped == 1
+    assert out[470, 300] == 0, "the rectangle is dropped"
+    assert out[180, 300] == 255, "the ellipse is kept"
+
+
+def test_rectangular_component_is_dropped_even_when_it_is_the_largest():
+    """On one real slide the chart bar outweighs either hemisphere, so rank
+    cannot be used to identify tissue."""
+    mask = np.zeros((900, 900), np.uint8)
+    cv2.rectangle(mask, (50, 600), (850, 880), 255, -1)             # big, printed
+    cv2.ellipse(mask, (300, 280), (150, 200), 0, 0, 360, 255, -1)   # smaller, tissue
+    cv2.ellipse(mask, (600, 280), (140, 190), 0, 0, 360, 255, -1)
+
+    areas = [int((mask[600:880, 50:850] > 0).sum())]
+    out, dropped = stages.drop_rectangular_components(mask, max_extent=0.80)
+
+    assert areas[0] > 0
+    assert dropped == 1
+    assert out[740, 450] == 0, "the printed bar is dropped despite being largest"
+    assert out[280, 300] == 255 and out[280, 600] == 255, "both lobes survive"
+
+
+def test_mask_is_never_emptied_by_the_rectangularity_test():
+    """If every component looks printed, the test is more likely wrong than the
+    slide empty, so the largest survives."""
+    mask = np.zeros((600, 600), np.uint8)
+    cv2.rectangle(mask, (50, 50), (550, 250), 255, -1)
+    cv2.rectangle(mask, (50, 350), (400, 500), 255, -1)
+
+    out, dropped = stages.drop_rectangular_components(mask, max_extent=0.80)
+
+    assert dropped == 1, "only the smaller one goes"
+    assert out[150, 300] == 255, "the largest is kept as a fallback"
+    assert (out > 0).any(), "the mask is never emptied"
+
+
+def test_elongation_is_required_as_well_as_rectangularity():
+    """A compact section can reach extent 0.759 while a chart bar sits at 0.778,
+    so extent alone cannot separate them. Only printed bars are also elongated."""
+    mask = np.zeros((900, 900), np.uint8)
+    cv2.rectangle(mask, (40, 100), (860, 290), 255, -1)    # extent 1.0, aspect 4.3
+    cv2.rectangle(mask, (300, 450), (700, 820), 255, -1)   # extent 1.0, aspect 1.08
+
+    out, dropped = stages.drop_rectangular_components(mask, max_extent=0.70,
+                                                      min_aspect=1.7)
+    assert dropped == 1
+    assert out[200, 450] == 0, "the elongated bar goes"
+    assert out[600, 500] == 255, "the compact block stays"
+
+
+def test_small_components_are_removed_by_physical_area():
+    mask = np.zeros((800, 800), np.uint8)
+    cv2.ellipse(mask, (400, 400), (250, 300), 0, 0, 360, 255, -1)   # a section
+    cv2.rectangle(mask, (20, 20), (60, 44), 255, -1)                # a label fragment
+
+    out, dropped = stages.drop_small_components(mask, PIXEL_SIZE_UM,
+                                                min_area_mm2=100.0)
+    assert dropped == 1
+    assert out[32, 40] == 0
+    assert out[400, 400] == 255
+
+
+def test_small_component_filter_never_empties_the_mask():
+    mask = np.zeros((400, 400), np.uint8)
+    cv2.rectangle(mask, (10, 10), (40, 40), 255, -1)
+    cv2.rectangle(mask, (100, 100), (118, 118), 255, -1)
+
+    out, dropped = stages.drop_small_components(mask, PIXEL_SIZE_UM,
+                                                min_area_mm2=10000.0)
+    assert (out > 0).any(), "the largest survives even when all look too small"
+    assert out[25, 25] == 255
+
+
+def test_small_component_filter_can_be_disabled():
+    mask = np.zeros((400, 400), np.uint8)
+    cv2.rectangle(mask, (10, 10), (40, 40), 255, -1)
+    out, dropped = stages.drop_small_components(mask, PIXEL_SIZE_UM, 0.0)
+    assert dropped == 0 and np.array_equal(out, mask)
+
+
+def test_rectangularity_filter_can_be_disabled():
+    mask = np.zeros((600, 600), np.uint8)
+    cv2.ellipse(mask, (300, 180), (200, 140), 0, 0, 360, 255, -1)
+    cv2.rectangle(mask, (100, 420), (500, 520), 255, -1)
+
+    out, dropped = stages.drop_rectangular_components(mask, max_extent=1.5)
+    assert dropped == 0 and np.array_equal(out, mask)
+
+
+def test_small_debris_is_not_judged_on_rectangularity():
+    """A tiny speck fills its bounding box too; the area floor keeps the test
+    from being applied where it is meaningless."""
+    mask = np.zeros((600, 600), np.uint8)
+    cv2.ellipse(mask, (300, 300), (200, 150), 0, 0, 360, 255, -1)
+    cv2.rectangle(mask, (10, 10), (18, 18), 255, -1)                # tiny square
+
+    out, dropped = stages.drop_rectangular_components(mask, max_extent=0.80)
+    assert dropped == 0, "below the area fraction, so not tested"
+    assert out[14, 14] == 255
+
+
+def test_largest_component_is_kept_even_when_it_touches_the_border():
+    """A section whose own tissue runs off the frame must not be deleted."""
+    mask = np.zeros((400, 400), np.uint8)
+    mask[100:400, 100:300] = 255          # large, touches the bottom edge
+    mask[0:20, 0:20] = 255                # small speck at the corner
+
+    out, dropped = stages.drop_border_components(mask)
+
+    assert out[350, 200] == 255, "the large border-touching region is kept"
+    assert out[10, 10] == 0, "the corner speck is dropped"
+    assert dropped == 1
+
+
+def test_tissue_bbox_tracks_the_tissue_with_a_margin():
+    mask = np.zeros((600, 600), np.uint8)
+    mask[200:400, 150:350] = 255
+
+    tight = stages.tissue_bbox(mask, PIXEL_SIZE_UM, margin_um=0)
+    assert tight == (200, 400, 150, 350)
+
+    margin_px = um_to_px(500.0, PIXEL_SIZE_UM)
+    y0, y1, x0, x1 = stages.tissue_bbox(mask, PIXEL_SIZE_UM, margin_um=500.0)
+    assert (y0, y1, x0, x1) == (200 - margin_px, 400 + margin_px,
+                                150 - margin_px, 350 + margin_px)
+
+    assert stages.tissue_bbox(np.zeros((10, 10), np.uint8), PIXEL_SIZE_UM, 0) is None
+
+
+def test_bbox_is_clipped_to_the_image(section):
+    mask = np.zeros((100, 100), np.uint8)
+    mask[0:100, 0:100] = 255
+    assert stages.tissue_bbox(mask, PIXEL_SIZE_UM, margin_um=5000.0) == (0, 100, 0, 100)
+
+
+def test_cropping_shrinks_the_outputs_and_records_the_origin(section):
+    from cleanslide import clean_section
+
+    cropped = clean_section(section, PIXEL_SIZE_UM)
+    full = clean_section(section, PIXEL_SIZE_UM, CleanParams(crop_to_tissue=False))
+
+    assert cropped.clean.shape < full.clean.shape
+    assert cropped.clean.shape == cropped.mask.shape == cropped.rgb.shape[:2]
+    # Without the origin a consumer cannot map a cropped coordinate back to the
+    # scan it came from, which registration needs.
+    assert cropped.info["crop_origin_xy"][0] >= 0
+    assert cropped.info["source_shape_hw"] == list(section.shape[:2])
+    assert cropped.info["output_shape_hw"] == list(cropped.mask.shape)
+    assert full.info["source_shape_hw"] == full.info["output_shape_hw"]
+    assert "crop_origin_xy" not in full.info
+
+
+def test_cropping_does_not_change_the_tissue_itself(section):
+    """The crop must move the window, not alter what is inside it."""
+    from cleanslide import clean_section
+
+    cropped = clean_section(section, PIXEL_SIZE_UM)
+    full = clean_section(section, PIXEL_SIZE_UM, CleanParams(crop_to_tissue=False))
+
+    x0, y0 = cropped.info["crop_origin_xy"]
+    h, w = cropped.info["output_shape_hw"]
+    assert np.array_equal(cropped.mask, full.mask[y0:y0 + h, x0:x0 + w])
+
+
 def test_bubble_detected_by_size_and_roundness(section):
     mask, _ = stages.tissue_mask(section, PIXEL_SIZE_UM, CleanParams())
     bubbles, info = stages.find_bubbles(mask, PIXEL_SIZE_UM, CleanParams())

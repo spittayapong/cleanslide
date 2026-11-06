@@ -78,6 +78,20 @@ def clean_section(rgb: np.ndarray, pixel_size_um: float,
 
     mask, mask_info = stages.tissue_mask(rgb, pixel_size_um, params)
     info.update(mask_info)
+
+    # Crop after the mask is finished, never before: the border filter above
+    # needs the real image edge, and cropping first would make everything touch
+    # it. The origin is recorded so output coordinates map back to the scan.
+    source_height, source_width = rgb.shape[:2]
+    info["source_shape_hw"] = [source_height, source_width]
+    if params.crop_to_tissue:
+        box = stages.tissue_bbox(mask, pixel_size_um, params.crop_margin_um)
+        if box is not None:
+            y0, y1, x0, x1 = box
+            rgb = rgb[y0:y1, x0:x1]
+            mask = mask[y0:y1, x0:x1]
+            info["crop_origin_xy"] = [x0, y0]
+    info["output_shape_hw"] = list(mask.shape[:2])
     record("tissue_mask", mask)
 
     bubbles, bubble_info = stages.find_bubbles(mask, pixel_size_um, params)
