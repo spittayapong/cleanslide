@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,6 +9,8 @@ description = "Artifact removal and tissue masking for histology sections"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Sutatip Pittayapong" }]
+license = "MIT"
+license-files = ["LICENSE"]
 keywords = ["histology", "microscopy", "BIDS", "image-processing"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -23,6 +25,10 @@ dependencies = [
     "opencv-python-headless>=4.8",
     "scipy>=1.10",
 ]
+
+[project.urls]
+Homepage = "https://github.com/spittayapong/cleanslide"
+Source = "https://github.com/spittayapong/cleanslide"
 
 [project.optional-dependencies]
 # The QC panel is the only thing needing matplotlib, and batch users do not

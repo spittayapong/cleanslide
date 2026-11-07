@@ -18,9 +18,8 @@ def section():
     """A bright slide with a tissue blob, a round bubble and specks.
 
     The tissue has two intensity bands and mild noise rather than being a flat
-    colour: a uniform blob has no percentile spread and no top-hat response, so
-    the normalisation and dust stages would correctly do nothing and the tests
-    would prove nothing.
+    colour: a uniform blob has no percentile spread, so the normalisation would
+    correctly do nothing and the tests would prove nothing.
     """
     rgb = np.full((600, 600, 3), 250, np.uint8)
     cv2.ellipse(rgb, (300, 300), (200, 240), 0, 0, 360, (150, 130, 170), -1)
@@ -340,55 +339,6 @@ def test_to_gray_inverts_inside_and_zeroes_outside(section):
     assert gray[300, 300] > 128, "dark tissue becomes bright after inversion"
 
 
-def test_remove_dust_reduces_speck_response(section):
-    mask, _ = stages.tissue_mask(section, PIXEL_SIZE_UM, CleanParams())
-    gray = stages.to_gray(section, mask)
-    cleaned, info = stages.remove_dust(gray, PIXEL_SIZE_UM, CleanParams())
-
-    assert cleaned.shape == gray.shape
-    assert info["dust_threshold"] >= 5.0
-    assert cleaned.std() <= gray.std() + 1e-6
-
-
-def test_normalise_stretches_tissue_and_keeps_background_zero(section):
-    mask, _ = stages.tissue_mask(section, PIXEL_SIZE_UM, CleanParams())
-    gray = stages.to_gray(section, mask)
-    out, info = stages.normalise_intensity(gray, mask, CleanParams())
-
-    inside = mask > 0
-    assert out[~inside].max() == 0, "background must stay zero"
-    assert np.ptp(out[inside]) > np.ptp(gray[inside]), "tissue range must widen"
-    assert info["normalise_high"] > info["normalise_low"]
-
-
-def test_normalise_is_scale_invariant(section):
-    """A pale stain and a dark one must end at the same brightness: the whole
-    reason the stage exists."""
-    mask, _ = stages.tissue_mask(section, PIXEL_SIZE_UM, CleanParams())
-    gray = stages.to_gray(section, mask)
-
-    pale = (gray.astype(np.float32) * 0.4).astype(np.uint8)
-    pale[mask == 0] = 0
-
-    bright, _ = stages.normalise_intensity(gray, mask, CleanParams())
-    lifted, _ = stages.normalise_intensity(pale, mask, CleanParams())
-
-    assert abs(int(bright[mask > 0].mean()) - int(lifted[mask > 0].mean())) < 12
-
-
-def test_dust_threshold_uses_tissue_pixels_only(section):
-    """With a large zero background the whole-frame median and MAD collapse to
-    zero, dropping the threshold to its floor and inpainting real tissue."""
-    mask, _ = stages.tissue_mask(section, PIXEL_SIZE_UM, CleanParams())
-    gray = stages.to_gray(section, mask)
-
-    _, masked = stages.remove_dust(gray, PIXEL_SIZE_UM, CleanParams(), mask)
-    _, whole = stages.remove_dust(gray, PIXEL_SIZE_UM, CleanParams())
-
-    assert masked["dust_threshold"] > whole["dust_threshold"]
-    assert masked["dust_area_px"] < whole["dust_area_px"]
-
-
 def test_suppress_folds_keeps_shape_and_background(section):
     mask, _ = stages.tissue_mask(section, PIXEL_SIZE_UM, CleanParams())
     gray = stages.to_gray(section, mask)
@@ -430,3 +380,41 @@ def test_parameters_transfer_across_resolution(pixel_size_um):
     params = CleanParams()
     blur_um = um_to_px(params.mask_blur_um, pixel_size_um) * pixel_size_um
     assert abs(blur_um - params.mask_blur_um) < pixel_size_um
+
+
+def test_mask_edge_smoothing_regularises_without_moving_the_region():
+    """A ragged outline reads badly once the mask is applied to the tissue, but
+    smoothing must not shift where the tissue is."""
+    rng = np.random.default_rng(3)
+    mask = np.zeros((600, 600), np.uint8)
+    cv2.circle(mask, (300, 300), 200, 255, -1)
+    # Chew the boundary the way the component filters do.
+    noise = rng.random(mask.shape) < 0.25
+    ring = cv2.dilate(mask, np.ones((9, 9), np.uint8)) - cv2.erode(mask, np.ones((9, 9), np.uint8))
+    mask[(ring > 0) & noise] = 0
+
+    out = stages.smooth_mask_edge(mask, PIXEL_SIZE_UM, 150.0)
+
+    def perimeter(m):
+        c, _ = cv2.findContours((m > 0).astype(np.uint8), cv2.RETR_EXTERNAL,
+                                cv2.CHAIN_APPROX_NONE)
+        return sum(cv2.arcLength(x, True) for x in c)
+
+    assert perimeter(out) < perimeter(mask), "the outline must get smoother"
+    assert abs(int((out > 0).sum()) - int((mask > 0).sum())) < 0.06 * (mask > 0).sum()
+    assert out[300, 300] == 255 and out[10, 10] == 0
+
+
+def test_mask_edge_smoothing_can_be_disabled():
+    mask = np.zeros((400, 400), np.uint8)
+    cv2.circle(mask, (200, 200), 120, 255, -1)
+    assert np.array_equal(stages.smooth_mask_edge(mask, PIXEL_SIZE_UM, 0.0), mask)
+
+
+def test_no_dust_stage_exists():
+    """Dust removal was removed: it inpainted 5-6% of the tissue and the loss
+    was visible in the middle of sections."""
+    from cleanslide.pipeline import STAGE_ORDER
+    assert not hasattr(stages, "remove_dust")
+    assert "remove_dust" not in STAGE_ORDER
+    assert not any(f.startswith("dust") for f in CleanParams().__dict__)

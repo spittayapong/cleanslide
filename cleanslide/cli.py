@@ -2,9 +2,10 @@
 
     cleanslide <bids_dir> <output_dir> participant [--participant-label ...]
 
-Everything the pipeline needs — subject, sample, stain, pixel size — comes from
-the dataset, so there is nothing to configure per section and no spreadsheet to
-keep in step with the data.
+Everything the pipeline needs — subject, sample, pixel size — comes from the
+dataset, so there is nothing to configure per section and no spreadsheet to
+keep in step with the data. The stain label is copied to the output filename
+and sidecar but no stage reads it, so the same parameters run on every stain.
 """
 import argparse
 import json
@@ -66,8 +67,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.qc:
-        # Fail now rather than after cleaning sixteen sections, since matplotlib
-        # is an optional extra that a core install will not have.
+        # matplotlib is only imported when a panel is drawn, which first happens
+        # after a section has already been cleaned. Check it up front so a core
+        # install fails immediately instead of part-way through a run.
         try:
             qc.require_matplotlib()
         except ImportError as error:
@@ -89,6 +91,10 @@ def main(argv: list[str] | None = None) -> int:
                                       __version__, OUTPUT_FORMAT_VERSION)
             if args.qc:
                 os.makedirs(qc_dir, exist_ok=True)
+                # The three published outputs, then the stage breakdown. The
+                # first is what a consumer receives; the second is why.
+                qc.output_panel(result, section.name,
+                                os.path.join(qc_dir, f"{section.name}_outputs.png"))
                 qc.stage_panel(result, section.name,
                                os.path.join(qc_dir, f"{section.name}_qc.png"))
             print(f"    -> {os.path.basename(written['clean'])}  "
@@ -97,8 +103,8 @@ def main(argv: list[str] | None = None) -> int:
                                  "bubbles_kept") if k in result.info}),
                   flush=True)
         except Exception:                            # noqa: BLE001
-            # One bad section must not abandon the other fifteen; the traceback
-            # goes to stderr and the exit code reflects the failure.
+            # One bad section must not abandon the rest of the run; the
+            # traceback goes to stderr and the exit code reflects the failure.
             failures += 1
             print(f"    FAILED {section.name}", file=sys.stderr)
             traceback.print_exc()

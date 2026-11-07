@@ -9,11 +9,6 @@ from scipy import ndimage as ndi
 
 from .params import CleanParams, um_to_px
 
-# Floor for the adaptive dust threshold. Without it, a section with very little
-# dust has a near-zero MAD and would have most of its texture flagged as specks.
-_DUST_MIN_THRESHOLD = 5.0
-
-
 def estimate_background_threshold(gray: np.ndarray, shoulder: float = 0.1) -> int:
     """Find the grey level separating glass background from tissue.
 
@@ -67,9 +62,8 @@ def drop_small_components(mask: np.ndarray, pixel_size_um: float,
                           min_area_mm2: float):
     """Remove components too small to be a piece of a tissue section.
 
-    Slide labels, grey-wedge fragments and debris. Across 16 sections the
-    distribution is cleanly bimodal: 94 components below 66 mm2 and 30 above
-    102 mm2, with nothing between, so the threshold does not sit on a cliff.
+    Slide labels, grey-wedge fragments and debris are far smaller than any
+    piece of a section, so the two separate cleanly by area.
     """
     if min_area_mm2 <= 0:
         return mask, 0
@@ -102,21 +96,13 @@ def drop_rectangular_components(mask: np.ndarray, max_extent: float,
     """Remove substantial mask components that nearly fill their bounding box.
 
     Printed matter on a slide — calibration charts, scale bars, label blocks —
-    is rectangular by construction, while tissue is not. Extent (component area
-    divided by bounding-box area) separates them with room to spare: on the
-    affected section the brain scores 0.648 and its temporal lobes 0.51 and
-    0.57, against 0.885 for the chart.
+    is rectangular by construction, while tissue is not. Extent, the component
+    area divided by its bounding-box area, separates the two with room to
+    spare.
 
     Only components at least ``min_area_fraction`` of the largest are tested, so
     small debris is not judged by a measure that is noisy at that size.
 
-    Rank is deliberately not a defence. An earlier version never dropped the
-    largest component, on the reasoning that it must be the section — but on one
-    slide the chart bar is larger than either hemisphere (1.83 Mpx at extent
-    0.887, against 1.64 and 1.52 Mpx at 0.638 and 0.478), so that rule protected
-    the chart and discarded nothing. Instead every component is judged on shape,
-    and the largest is kept only as a fallback if the test would empty the mask
-    entirely.
     """
     if max_extent > 1.0:
         return mask, 0
@@ -141,8 +127,8 @@ def drop_rectangular_components(mask: np.ndarray, max_extent: float,
         if not box:
             continue
         aspect = max(width / height, height / width)
-        # Both tests, not either: a compact section reaches extent 0.759 and an
-        # elongated one reaches aspect 2.5, but only printed bars do both.
+        # Both tests, not either: a compact section can score high on extent
+        # and an elongated one high on aspect, but only printed bars do both.
         if area / box > max_extent and aspect > min_aspect:
             printed.append(label)
 
@@ -157,6 +143,25 @@ def drop_rectangular_components(mask: np.ndarray, max_extent: float,
     out = mask.copy()
     out[np.isin(labels, printed)] = 0
     return out, len(printed)
+
+
+def smooth_mask_edge(mask: np.ndarray, pixel_size_um: float,
+                     smooth_um: float) -> np.ndarray:
+    """Regularise the mask boundary without moving the region.
+
+    Blur the binary mask and re-threshold at the half level: the outline is
+    pulled smooth while anything solidly inside or outside stays where it is.
+    The component filters leave a boundary that follows individual pixels,
+    which reads as a ragged edge once the mask is applied to the tissue.
+    """
+    if smooth_um <= 0:
+        return mask
+    kernel = um_to_px(smooth_um, pixel_size_um, odd=True)
+    if kernel < 3:
+        return mask
+    blurred = cv2.GaussianBlur(mask, (kernel, kernel), 0)
+    _, out = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
+    return out
 
 
 def tissue_mask(rgb: np.ndarray, pixel_size_um: float, params: CleanParams):
@@ -303,50 +308,12 @@ def to_masked_rgb(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
 
     Kept alongside the grayscale output as the colour reference: it still shows
     the stain, which the inverted, normalised grayscale no longer does. Bubbles
-    are already inpainted at this point; dust is not, because dust detection runs
-    on the inverted grayscale where specks are bright.
+    are already inpainted at this point.
     """
     out = np.zeros_like(rgb)
     inside = mask > 0
     out[inside] = rgb[inside]
     return out
-
-
-def remove_dust(gray: np.ndarray, pixel_size_um: float, params: CleanParams,
-                mask: np.ndarray | None = None):
-    """Remove bright specks smaller than the top-hat structuring element.
-
-    The detection threshold is a multiple of the MAD of the top-hat response, so
-    it follows each section's noise rather than assuming an absolute grey level
-    the way the prototype's hard-coded 25 did.
-
-    The statistics are taken over tissue pixels only. Across the whole frame the
-    zero background dominates — on a section filling half the slide both the
-    median and the MAD collapse to zero, the threshold falls to its floor, and
-    ordinary tissue texture is inpainted as dust.
-    """
-    size = um_to_px(params.dust_tophat_um, pixel_size_um, odd=True)
-    element = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
-    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, element)
-
-    sample = tophat[mask > 0] if mask is not None and (mask > 0).any() else tophat
-    median = float(np.median(sample))
-    mad = float(np.median(np.abs(sample - median)))
-    threshold = max(_DUST_MIN_THRESHOLD, median + params.dust_mad_k * 1.4826 * mad)
-
-    specks = (tophat > threshold).astype(np.uint8) * 255
-    if mask is not None:
-        # Never inpaint outside the tissue: the background is flat zero and any
-        # response there is an artefact of the mask edge.
-        specks[mask == 0] = 0
-    cleaned = inpaint(gray, specks, pixel_size_um, params.dust_inpaint_radius_um)
-
-    info = {
-        "dust_tophat_px": size,
-        "dust_threshold": round(threshold, 2),
-        "dust_area_px": int((specks > 0).sum()),
-    }
-    return cleaned, info
 
 
 def normalise_intensity(gray: np.ndarray, mask: np.ndarray, params: CleanParams):
@@ -408,8 +375,8 @@ def enhance_clahe(gray: np.ndarray, mask: np.ndarray, pixel_size_um: float,
                   params: CleanParams) -> np.ndarray:
     """Local contrast equalisation, applied only inside the tissue.
 
-    Tiles are sized in micrometres. Both prototypes used a fixed 5x5 grid, which
-    silently meant 22 mm tiles on one dataset and 11.7 mm on the other.
+    Tiles are sized in micrometres rather than as a fixed grid, so a tile
+    covers the same physical area whatever the scan resolution.
     """
     tile_px = um_to_px(params.clahe_tile_um, pixel_size_um)
     height, width = gray.shape[:2]
@@ -427,9 +394,9 @@ def enhance_clahe(gray: np.ndarray, mask: np.ndarray, pixel_size_um: float,
 def enhance_sigmoid(gray: np.ndarray, mask: np.ndarray, params: CleanParams):
     """S-curve contrast with its centre estimated from the tissue histogram.
 
-    The prototype fixed the centre at 0.52, hand-tuned for one section. Otsu
-    inside the mask finds the same boundary — between white matter and cortex —
-    on any section.
+    A fixed centre has to be hand-tuned per section. Otsu inside the mask
+    finds the same boundary — between white matter and cortex — on any
+    section, without tuning.
     """
     inside = mask > 0
     if not inside.any():

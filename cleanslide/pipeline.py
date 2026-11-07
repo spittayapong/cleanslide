@@ -19,8 +19,9 @@ from .params import CleanParams
 # Order matters: artefacts are removed
 # from the colour image first, so inpainting has real colour to work from, and
 # intensity processing runs last on the repaired grayscale.
-STAGE_ORDER = ("tissue_mask", "remove_bubbles", "to_masked_rgb", "to_gray",
-               "normalise", "remove_dust", "suppress_folds", "enhance")
+STAGE_ORDER = ("tissue_mask", "remove_bubbles", "smooth_mask",
+               "to_masked_rgb", "to_inverted_gray", "normalise",
+               "suppress_folds", "enhance")
 
 
 @dataclass
@@ -29,7 +30,7 @@ class CleanResult:
 
     # Grayscale, inverted and normalised: what the registration step consumes.
     clean: np.ndarray
-    # Binary tissue mask, 0 or 255. Bubbles stay as holes in it.
+    # Binary tissue mask, 0 or 255. 
     mask: np.ndarray
     # The colour section with bubbles inpainted and the background blacked out.
     # Keeps the stain visible, which `clean` no longer does once inverted.
@@ -38,7 +39,7 @@ class CleanResult:
     info: dict = field(default_factory=dict)
     # Intermediate images, populated only when keep_stages=True. Used by the QC
     # panel and the regression suite; skipped otherwise to save memory, which
-    # matters on the 14k x 12k sections.
+    # matters when a section runs to hundreds of megapixels.
     intermediates: dict = field(default_factory=dict)
 
 
@@ -100,24 +101,25 @@ def clean_section(rgb: np.ndarray, pixel_size_um: float,
                               params.bubble_dilate_um)
     record("remove_bubbles", repaired)
 
+    # Last mask operation: regularise the outline so the masked tissue does not
+    # carry a pixel-level ragged edge. After bubble detection, which reads the
+    # mask's holes and wants them as the detector saw them.
+    mask = stages.smooth_mask_edge(mask, pixel_size_um, params.mask_smooth_um)
+    record("smooth_mask", mask)
+
     colour = stages.to_masked_rgb(repaired, mask)
     record("to_masked_rgb", colour)
 
     gray = stages.to_gray(repaired, mask)
-    record("to_gray", gray)
+    record("to_inverted_gray", gray)
 
     # First, so that every threshold downstream works on the same scale. A pale
-    # stain inverts into a narrow band (roughly 42-71 of 255 on LFB-PAS), where
-    # the top-hat response and its MAD are both tiny and the dust threshold
-    # collapses to its floor, inpainting ordinary tissue as specks.
+    # stain inverts into a narrow band, and anything estimated from that band
+    # is estimated from a fraction of the range the enhancement below assumes.
     if params.normalise:
         gray, normalise_info = stages.normalise_intensity(gray, mask, params)
         info.update(normalise_info)
         record("normalise", gray)
-
-    gray, dust_info = stages.remove_dust(gray, pixel_size_um, params, mask)
-    info.update(dust_info)
-    record("remove_dust", gray)
 
     if params.suppress_folds:
         gray = stages.suppress_folds(gray, mask, pixel_size_um, params)

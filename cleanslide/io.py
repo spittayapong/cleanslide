@@ -1,9 +1,7 @@
 """Reading sections from a BIDS microscopy dataset and writing the derivative.
 
-The dataset is the single source of metadata: subject, sample and stain come
-from the filename entities, and the pixel size from the sidecar's required
-``PixelSize`` field. Nothing is passed on the command line and nothing is
-guessed — a section whose scale cannot be read is an error, not a default.
+The dataset is the single source of metadata. Subject and sample come from the
+filename entities and the pixel size from the sidecar's required ``PixelSize``.
 """
 import json
 import os

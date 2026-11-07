@@ -2,7 +2,8 @@
 
 Shows what each stage did rather than only the endpoint, so a result that looks
 plausible but was produced by the wrong stage is still visible. Images are
-downsampled for display; a 14k x 12k section would otherwise dominate the file.
+downsampled for display; a full-resolution section would otherwise dominate
+the file.
 """
 import numpy as np
 
@@ -30,9 +31,9 @@ def _pyplot():
 _CAPTIONS = {
     "tissue_mask": "tissue mask",
     "remove_bubbles": "bubbles inpainted (RGB)",
+    "smooth_mask": "mask with its edge smoothed",
     "to_masked_rgb": "colour output, background removed",
-    "to_gray": "grayscale, inverted in mask",
-    "remove_dust": "dust removed",
+    "to_inverted_gray": "grayscale, inverted in mask",
     "normalise": "tissue stretched to full range",
     "suppress_folds": "folds suppressed",
     "enhance": "intensity enhanced",
@@ -51,6 +52,46 @@ def _thumbnail(image: np.ndarray, longest: int = 700) -> np.ndarray:
     import cv2
     return cv2.resize(image, None, fx=scale, fy=scale,
                       interpolation=cv2.INTER_AREA)
+
+
+def output_panel(result, title: str, out_path: str) -> str:
+    """The three published outputs side by side, downsampled, for review.
+
+    The stage panel contains these too, but labelled as stages and mixed in with
+    the intermediates. This is what a consumer of the dataset actually receives,
+    and unlike the stage panel it needs no ``keep_stages``, so it can be written
+    for every section of a batch run.
+    """
+    plt = _pyplot()
+    fig, axes = plt.subplots(1, 3, figsize=(16.5, 6.2))
+
+    for axis, (image, caption) in zip(axes, (
+            (result.clean, "grayscale  (desc-clean_BF)\nregistration input"),
+            (result.mask, "tissue mask  (desc-tissue_mask)"),
+            (result.rgb, "colour, background removed\n(desc-cleanrgb_BF)"))):
+        small = _thumbnail(image)
+        axis.imshow(small, cmap=None if small.ndim == 3 else "gray",
+                    vmin=None if small.ndim == 3 else 0,
+                    vmax=None if small.ndim == 3 else 255)
+        axis.set_title(caption, fontsize=10)
+        axis.set_xticks([])
+        axis.set_yticks([])
+
+    height, width = result.mask.shape[:2]
+    summary = "   ".join(filter(None, [
+        f"{width}x{height} px at {result.pixel_size_um} um/px",
+        f"mask {result.info.get('mask_area_mm2', '?')} mm2",
+        f"{result.info.get('mask_components', '?')} component(s)",
+        f"bubbles removed {result.info.get('bubbles_kept', '?')}",
+        f"separability {result.info.get('tissue_separability', '?')}",
+    ]))
+    fig.suptitle(title, fontsize=13)
+    fig.text(0.5, 0.012, summary, ha="center", fontsize=9, family="monospace")
+
+    fig.tight_layout(rect=(0, 0.04, 1, 0.97))
+    fig.savefig(out_path, dpi=100, format="png")
+    plt.close(fig)
+    return out_path
 
 
 def stage_panel(result, title: str, out_path: str) -> str:
@@ -83,7 +124,7 @@ def stage_panel(result, title: str, out_path: str) -> str:
         axis.axis("off")
 
     # The measured values belong next to the pictures: a mask that looks fine
-    # but shattered into 40 components is only visible in the numbers.
+    # but shattered into many components is only visible in the numbers.
     summary = "   ".join(
         f"{key}={result.info[key]}" for key in
         ("background_threshold", "bubbles_kept", "mask_components",
