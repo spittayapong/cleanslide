@@ -40,6 +40,19 @@ def _entities(filename: str) -> dict:
     return {m.group("key"): m.group("value") for m in _ENTITY.finditer(filename)}
 
 
+def _stain_from(meta: dict) -> str | None:
+    """A stain entity derived from the sidecar, for filenames that omit one.
+
+    The ``stain-`` entity is what keeps two images of one sample apart, but a
+    dataset may record the stain only in ``SampleStaining``. Reading it from
+    there keeps that information in the derivative's name instead of dropping
+    it. Entity values must be alphanumeric, so "LFB-PAS" becomes "LFBPAS";
+    the sidecar keeps the original spelling.
+    """
+    label = "".join(c for c in (meta.get("SampleStaining") or "") if c.isalnum())
+    return label or None
+
+
 def read_pixel_size_um(sidecar_path: str) -> tuple[float, dict]:
     """Read PixelSize from a BIDS sidecar and convert it to micrometres."""
     if not os.path.exists(sidecar_path):
@@ -96,7 +109,7 @@ def find_sections(bids_dir: str, participant_labels: list[str] | None = None,
                 path=os.path.join(micr, filename),
                 subject=entities.get("sub", label),
                 sample=entities.get("sample", stem),
-                stain=entities.get("stain"),
+                stain=entities.get("stain") or _stain_from(meta),
                 pixel_size_um=pixel_size_um,
                 staining=meta.get("SampleStaining"),
             ))

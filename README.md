@@ -2,8 +2,7 @@
 
 Artifact removal and tissue masking for histology sections, producing
 registration-ready images. One pipeline for any dataset and any stain: the
-processing stages are fixed, every parameter is a physical size in micrometres,
-and the per-section scale is read from the dataset rather than configured.
+processing stages are fixed, every parameter is a physical size in micrometres.
 
 Input is a [BIDS microscopy](https://bids-specification.readthedocs.io/en/stable/modality-specific-files/microscopy.html)
 dataset; output is a BIDS derivative.
@@ -41,8 +40,9 @@ Two optional extras:
 | `cleanslide[qc]` | matplotlib | the QC panels, `--qc` |
 | `cleanslide[test]` | pytest | running the test suite |
 
-`--qc` without matplotlib exits with status 2 and a message naming the extra,
-before any section is processed, rather than failing after an hour of work.
+If you use `--qc` without matplotlib, cleanslide stops right away and tells you
+to install `cleanslide[qc]`. It checks this before it starts on the first
+section, so a long run never fails halfway through.
 
 ## Input
 
@@ -77,9 +77,7 @@ What the pipeline reads, and from where:
 
 The stain is read from both places and required in neither. The label is
 copied to the output filename and sidecar, but no stage reads it, so the same
-parameters run on H&E, LFB-PAS and DAB-TBB. Drop the `stain-` entity and the
-outputs simply lose that entity too; leave `SampleStaining` out of the sidecar
-and it comes through as null.
+parameters run on any stain.
 
 Accepted image formats are `.tif`, `.tiff` and `.png`. **Not JPEG** — BIDS does
 not permit it for microscopy. Convert before building the dataset; re-wrapping a
@@ -93,16 +91,12 @@ contain dots or hyphens: `P3.1` section `09` has to become something like
 
 ### Pixel size is mandatory, and it matters more than anything else here
 
-Every filter in the pipeline is specified as a physical size — a 1.1 mm opening,
-a 2.5–4.5 mm bubble, a 12 mm CLAHE tile — and converted to pixels through the
-section's own pixel size. That is what lets one parameter set work on data
-scanned at 4 µm/px and at 31.75 µm/px.
+Every filter in the pipeline is specified as a physical size and converted to
+pixels through the section's own pixel size.
 
-It also means a wrong pixel size **does not raise an error**. It silently
-rescales every filter at once, so the pipeline runs to completion and removes
-the wrong objects. A section declared at 4 µm/px that is really 31.75 µm/px gets
-filters eight times too small, and the bubble detector looks for 2.5 mm bubbles
-in a window a third of a millimetre wide.
+A wrong pixel size **does not raise an error**. It silently rescales every
+filter at once, so the pipeline runs to completion and removes the wrong
+objects.
 
 `cleanslide` therefore refuses a section whose scale it cannot read, rather than
 assuming one. If `PixelSize` is missing from a sidecar, that section is an error.
@@ -113,11 +107,11 @@ Per section, in order:
 
 | Stage | What it removes or produces |
 |---|---|
-| `tissue_mask` | threshold → blur → Otsu → morphological open, then drop printed charts, labels and debris; crop to the tissue |
+| `tissue_mask` | luminance threshold → blur → Otsu → morphological open, then drop printed charts, labels and debris; crop to the tissue |
 | `remove_bubbles` | round mounting-medium bubbles, filtered by area and circularity, then inpainted |
 | `smooth_mask` | regularise the mask outline so the masked tissue has no ragged pixel border |
 | `to_masked_rgb` | the colour section with the background blacked out |
-| `to_inverted_gray` | invert, so tissue is bright and the background 0 |
+| `to_inverted_gray` | invert, so tissue appearance looks close to T1-weighted MRI |
 | `normalise` | stretch the tissue to the full range, by percentile |
 | `suppress_folds` | tissue folds and thin bright laminae, via grayscale opening *(off by default)* |
 | `enhance` | CLAHE inside the mask, or a sigmoid contrast curve |
@@ -154,7 +148,7 @@ A BIDS derivative. Per section, under `<output_dir>/sub-<label>/micr/`:
 | File | What |
 |---|---|
 | `…_desc-clean_BF.tif` | 8-bit grayscale, deflate — inverted, stretched, background 0. What a registration step consumes. |
-| `…_desc-tissue_mask.tif` | 8-bit, deflate — 0 or 255. Bubbles stay as holes. |
+| `…_desc-tissue_mask.tif` | 8-bit, deflate — 0 or 255. |
 | `…_desc-cleanrgb_BF.tif` | 8-bit RGB, deflate — the colour section with the background removed |
 | `…_desc-clean_BF.json` | the sidecar |
 
@@ -170,10 +164,6 @@ many bubbles were found against how many were kept.
 The sidecar is authoritative for the pixel size. The TIFF resolution tags carry
 the same value so a file opens correctly in Fiji or QuPath on its own, but a
 reader should prefer the sidecar.
-
-`OUTPUT_FORMAT_VERSION` versions that schema. `cleanslide` owns the layout and
-the schema; a consumer reads the TIFFs and the JSON and should not import this
-package.
 
 ### QC
 
@@ -202,23 +192,6 @@ Inverting restores the T1 ordering, and the background is set to 0 rather than
 inverted to white, which matches a skull-stripped T1. The registration's
 similarity measure then compares like with like instead of having to bridge an
 inverted contrast.
-
-## Known limitations
-
-- **The mask includes background between gyri and folia.** The blur that forms
-  the mask has to be wide enough to bridge gaps inside tissue, and that same
-  width spans a sulcus. Sharpening it on brightness does not work, because pale
-  tissue and glass overlap in grey. A colour-based refinement was tried and
-  reverted: it cleared the sulci on most sections but removed real tissue from a
-  faint DAB section, where unstained tissue is as colourless as glass.
-- **Bubble detection is conservative.** Circularity is the discriminating test,
-  so a bubble that has burst, merged or sits at the tissue edge is not removed.
-  On some sections every candidate is rejected and the stage does nothing;
-  `Measurements` records `bubbles_found` against `bubbles_kept` so you can see
-  when that happened.
-- **No anti-aliasing before downsampling.** `cleanslide` does not pre-smooth,
-  because it does not know your target resolution. A consumer that downsamples
-  must apply its own anti-alias filter.
 
 ## Data and attribution
 
@@ -250,7 +223,3 @@ cd cleanslide
 pip install -e '.[qc,test]'
 pytest
 ```
-
-The tests run on synthetic sections, so they need no data and carry none.
-Anything under `local/` is git-ignored scratch. Demo notebooks and tests use
-public NextBrain data only.

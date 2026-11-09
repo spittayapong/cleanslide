@@ -177,17 +177,51 @@ def test_one_unreadable_section_does_not_abandon_the_others(dataset, tmp_path,
             "sub-01_sample-A1_stain-LFB_desc-clean_BF.tif").exists()
 
 
-# ── entities ─────────────────────────────────────────────────────────────────
+# ── where the stain entity comes from ────────────────────────────────────────
 
-def test_a_section_without_a_stain_entity_is_processed(tmp_path):
-    # The stain is metadata, not an input: its absence must not stop a run.
+def stain_of(out, subject="sub-01", sample="sample-A1"):
+    """The stain entity on the written output, or None if it carries none."""
+    produced = sorted((out / subject / "micr")
+                      .glob(f"{subject}_{sample}*_desc-clean_BF.tif"))
+    assert len(produced) == 1, produced
+    entities = dict(part.split("-", 1) for part in produced[0].name.split("_")
+                    if "-" in part)
+    return entities.get("stain")
+
+
+def test_filename_entity_wins_over_the_sidecar(tmp_path):
+    # Both present and disagreeing: BIDS names a file by its entities.
+    write_section(tmp_path / "sub-01" / "micr", "sub-01_sample-A1_stain-LFB",
+                  sidecar={**SIDECAR, "SampleStaining": "HE"})
+    out = tmp_path / "derivative"
+
+    assert main([str(tmp_path), str(out), "participant"]) == 0
+    assert stain_of(out) == "LFB"
+
+
+def test_sidecar_supplies_the_stain_when_the_filename_omits_it(tmp_path):
+    # Otherwise the derivative would silently drop what the input recorded.
+    write_section(tmp_path / "sub-01" / "micr", "sub-01_sample-A1",
+                  sidecar={**SIDECAR, "SampleStaining": "LFB-PAS"})
+    out = tmp_path / "derivative"
+
+    assert main([str(tmp_path), str(out), "participant"]) == 0
+    # Entity values must be alphanumeric, so the hyphen goes.
+    assert stain_of(out) == "LFBPAS"
+    # The sidecar keeps the original spelling.
+    meta = json.loads((out / "sub-01" / "micr" /
+                       "sub-01_sample-A1_stain-LFBPAS_desc-clean_BF.json").read_text())
+    assert meta["SampleStaining"] == "LFB-PAS"
+
+
+def test_no_stain_anywhere_leaves_the_entity_off(tmp_path):
+    # The stain is metadata, not an input: its absence must not stop a run,
+    # and nothing is invented to fill the gap.
     write_section(tmp_path / "sub-01" / "micr", "sub-01_sample-A1",
                   sidecar={"PixelSize": [PIXEL_SIZE_UM, PIXEL_SIZE_UM],
                            "PixelSizeUnits": "um"})
     out = tmp_path / "derivative"
 
-    code = main([str(tmp_path), str(out), "participant"])
-
-    assert code == 0
-    # The output simply loses the entity too, rather than inventing one.
+    assert main([str(tmp_path), str(out), "participant"]) == 0
+    assert stain_of(out) is None
     assert (out / "sub-01" / "micr" / "sub-01_sample-A1_desc-clean_BF.tif").exists()
