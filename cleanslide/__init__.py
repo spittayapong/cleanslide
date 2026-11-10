@@ -23,7 +23,7 @@ __all__ = [
     "OUTPUT_FORMAT_VERSION",
 ]
 
-__version__ = "0.1.0.dev0"
+__version__ = "0.1.0"
 
 # Version of the output layout and JSON sidecar schema. Readers should check it.
 OUTPUT_FORMAT_VERSION = 1

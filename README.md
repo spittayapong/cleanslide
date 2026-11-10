@@ -7,10 +7,6 @@ processing stages are fixed, every parameter is a physical size in micrometres.
 Input is a [BIDS microscopy](https://bids-specification.readthedocs.io/en/stable/modality-specific-files/microscopy.html)
 dataset; output is a BIDS derivative.
 
-> **Status: in development, nothing released yet.** The output layout and the
-> sidecar schema are settled and versioned by `OUTPUT_FORMAT_VERSION`, so a
-> downstream package can rely on them. Everything else may still move.
-
 ## Example
 
 One section in, three outputs out:
