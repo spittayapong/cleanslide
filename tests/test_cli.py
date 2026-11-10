@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 from cleanslide.cli import main
+from cleanslide.params import CleanParams
 
 PIXEL_SIZE_UM = 31.75
 SIDECAR = {"PixelSize": [PIXEL_SIZE_UM, PIXEL_SIZE_UM],
@@ -225,3 +226,106 @@ def test_no_stain_anywhere_leaves_the_entity_off(tmp_path):
     assert main([str(tmp_path), str(out), "participant"]) == 0
     assert stain_of(out) is None
     assert (out / "sub-01" / "micr" / "sub-01_sample-A1_desc-clean_BF.tif").exists()
+
+
+# ── the component size threshold ─────────────────────────────────────────────
+
+def test_min_component_mm2_is_adjustable(tmp_path):
+    # Detached tissue can be far smaller than the debris the default rejects,
+    # so the threshold has to be reachable without editing the package.
+    micr = tmp_path / "sub-01" / "micr"
+    micr.mkdir(parents=True)
+    # 71 mm2 and 11 mm2 at this pixel size, both wide enough to survive the
+    # 1.1 mm opening that runs before any component filter.
+    rgb = np.full((600, 600, 3), 250, np.uint8)
+    cv2.circle(rgb, (200, 300), 150, (120, 100, 140), -1)    # the section
+    cv2.circle(rgb, (480, 300), 60, (120, 100, 140), -1)     # a detached piece
+    cv2.imwrite(str(micr / "sub-01_sample-A1_stain-LFB_BF.tif"), rgb)
+    (micr / "sub-01_sample-A1_stain-LFB_BF.json").write_text(json.dumps(SIDECAR))
+
+    def components(out_dir, *extra):
+        assert main([str(tmp_path), str(out_dir), "participant", *extra]) == 0
+        meta = json.loads((out_dir / "sub-01" / "micr" /
+                           "sub-01_sample-A1_stain-LFB_desc-clean_BF.json").read_text())
+        return meta["Measurements"]["mask_components"]
+
+    strict = components(tmp_path / "strict", "--min-component-mm2", "50")
+    keep_all = components(tmp_path / "keep_all", "--min-component-mm2", "0")
+
+    assert strict == 1          # 11 mm2 is below the threshold, so it goes
+    assert keep_all == 2        # and is kept when the threshold allows it
+
+
+# ── where the background threshold comes from ────────────────────────────────
+
+def threshold_used(out_dir):
+    meta = json.loads((out_dir / "sub-01" / "micr" /
+                       "sub-01_sample-A1_stain-LFB_desc-clean_BF.json").read_text())
+    return meta["Measurements"]["background_threshold"], meta["Parameters"]
+
+
+def test_default_applies_when_the_sidecar_says_nothing(tmp_path):
+    write_section(tmp_path / "sub-01" / "micr", "sub-01_sample-A1_stain-LFB")
+    out = tmp_path / "derivative"
+
+    assert main([str(tmp_path), str(out), "participant"]) == 0
+    used, _ = threshold_used(out)
+    assert used == CleanParams().background_threshold
+
+
+def test_sidecar_overrides_the_default(tmp_path):
+    write_section(tmp_path / "sub-01" / "micr", "sub-01_sample-A1_stain-LFB",
+                  sidecar={**SIDECAR, "BackgroundThreshold": 212})
+    out = tmp_path / "derivative"
+
+    assert main([str(tmp_path), str(out), "participant"]) == 0
+    used, params = threshold_used(out)
+    assert used == 212
+    # Recorded as asked for as well as used, so a reader can tell a declared
+    # level from the estimator happening to land on the same number.
+    assert params["background_threshold"] == 212
+
+
+def test_command_line_overrides_the_sidecar(tmp_path):
+    write_section(tmp_path / "sub-01" / "micr", "sub-01_sample-A1_stain-LFB",
+                  sidecar={**SIDECAR, "BackgroundThreshold": 212})
+    out = tmp_path / "derivative"
+
+    assert main([str(tmp_path), str(out), "participant",
+                 "--background-threshold", "228"]) == 0
+    used, _ = threshold_used(out)
+    assert used == 228
+
+
+def test_auto_restores_the_per_section_estimate(tmp_path):
+    write_section(tmp_path / "sub-01" / "micr", "sub-01_sample-A1_stain-LFB",
+                  sidecar={**SIDECAR, "BackgroundThreshold": 212})
+    out = tmp_path / "derivative"
+
+    assert main([str(tmp_path), str(out), "participant",
+                 "--background-threshold", "auto"]) == 0
+    used, params = threshold_used(out)
+    assert params["background_threshold"] is None
+    assert used != 212, "the estimate replaced the level the sidecar asked for"
+
+
+def test_a_sidecar_can_ask_for_estimation(tmp_path):
+    # How a stain that no fixed level suits travels with its own data.
+    write_section(tmp_path / "sub-01" / "micr", "sub-01_sample-A1_stain-LFB",
+                  sidecar={**SIDECAR, "BackgroundThreshold": "auto"})
+    out = tmp_path / "derivative"
+
+    assert main([str(tmp_path), str(out), "participant"]) == 0
+    _, params = threshold_used(out)
+    assert params["background_threshold"] is None
+
+
+@pytest.mark.parametrize("value", [300, -1, "nonsense", True])
+def test_an_unusable_sidecar_threshold_is_rejected(tmp_path, capsys, value):
+    write_section(tmp_path / "sub-01" / "micr", "sub-01_sample-A1_stain-LFB",
+                  sidecar={**SIDECAR, "BackgroundThreshold": value})
+
+    code = main([str(tmp_path), str(tmp_path / "out"), "participant"])
+
+    assert code == 2
+    assert "BackgroundThreshold" in capsys.readouterr().err

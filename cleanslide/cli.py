@@ -8,6 +8,7 @@ keep in step with the data. The stain label is copied to the output filename
 and sidecar but no stage reads it, so the same parameters run on every stain.
 """
 import argparse
+import dataclasses
 import json
 import os
 import sys
@@ -16,6 +17,21 @@ import traceback
 from . import OUTPUT_FORMAT_VERSION, __version__, io, qc
 from .params import CleanParams
 from .pipeline import clean_section
+
+
+def background_threshold(text: str):
+    """An 8-bit grey level, or "auto" to estimate it per section."""
+    if text.lower() == "auto":
+        return "auto"
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f'expected a number 0-255 or "auto", got {text!r}') from None
+    if not 0 <= value <= 255:
+        raise argparse.ArgumentTypeError(
+            f"{value} is outside the 0-255 range of an 8-bit grey level")
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -38,6 +54,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--suppress-folds", action="store_true",
                         help="delete bright structures narrower than the fold "
                              "size; intended for cerebellar sections")
+    parser.add_argument("--min-component-mm2", type=float,
+                        default=CleanParams().mask_min_component_mm2,
+                        metavar="MM2",
+                        help="drop mask components smaller than this; lower it "
+                             "when a section has genuinely detached tissue, 0 "
+                             "keeps everything (default: %(default)s)")
+    parser.add_argument("--background-threshold", type=background_threshold,
+                        metavar="N", help=(
+                            "grey level above which a pixel is slide, or "
+                            '"auto" to estimate it per section. Overrides any '
+                            "BackgroundThreshold in a section's sidecar; "
+                            "without either, the default of %d applies"
+                            % CleanParams().background_threshold))
     parser.add_argument("--version", action="version",
                         version=f"cleanslide {__version__}")
     return parser
@@ -53,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
     params = CleanParams(
         enhance=args.enhance,
         suppress_folds=args.suppress_folds,
+        mask_min_component_mm2=args.min_component_mm2,
     )
 
     try:
@@ -76,6 +106,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {error}", file=sys.stderr)
             return 2
 
+    if args.background_threshold is not None:
+        print("note: background threshold set to %s for every section, "
+              "overriding any the sidecars declare. Check the mask per stain: "
+              "a level far below a section's own background takes tissue with "
+              "it." % args.background_threshold, file=sys.stderr)
+
     io.write_dataset_description(args.output_dir, __version__)
     qc_dir = args.qc_dir or os.path.join(args.output_dir, "qc")
 
@@ -85,10 +121,23 @@ def main(argv: list[str] | None = None) -> int:
               f"({section.pixel_size_um} um/px)", flush=True)
         try:
             rgb = io.read_image(section)
-            result = clean_section(rgb, section.pixel_size_um, params,
+            # Command line first, then whatever the section's sidecar asked
+            # for, then the default already in params.
+            section_params = params
+            if args.background_threshold is not None:
+                section_params = dataclasses.replace(
+                    params, background_threshold=(
+                        None if args.background_threshold == "auto"
+                        else args.background_threshold))
+            elif section.declares_background_threshold:
+                section_params = dataclasses.replace(
+                    params, background_threshold=section.background_threshold)
+
+            result = clean_section(rgb, section.pixel_size_um, section_params,
                                    keep_stages=args.qc)
-            written = io.write_result(result, section, args.output_dir, params,
-                                      __version__, OUTPUT_FORMAT_VERSION)
+            written = io.write_result(result, section, args.output_dir,
+                                      section_params, __version__,
+                                      OUTPUT_FORMAT_VERSION)
             if args.qc:
                 os.makedirs(qc_dir, exist_ok=True)
                 # The three published outputs, then the stage breakdown. The

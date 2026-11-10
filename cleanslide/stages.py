@@ -90,19 +90,25 @@ def drop_small_components(mask: np.ndarray, pixel_size_um: float,
     return out, len(small)
 
 
-def drop_rectangular_components(mask: np.ndarray, max_extent: float,
-                                min_aspect: float = 1.7,
-                                min_area_fraction: float = 0.05):
-    """Remove substantial mask components that nearly fill their bounding box.
+def drop_rectangular_components(mask: np.ndarray, gray: np.ndarray,
+                                max_extent: float, min_aspect: float = 1.7,
+                                min_area_fraction: float = 0.05,
+                                max_sd: float = 45.0):
+    """Remove substantial mask components that are printed matter, not tissue.
 
-    Printed matter on a slide — calibration charts, scale bars, label blocks —
-    is rectangular by construction, while tissue is not. Extent, the component
-    area divided by its bounding-box area, separates the two with room to
-    spare.
+    Three tests, all of which must agree: the component nearly fills its
+    bounding box, it is elongated, and the grey levels inside it vary more
+    than tissue ever does.
+
+    Shape alone is not enough, and relying on it deleted whole brain sections.
+    A section cut as a long cortical strip is geometrically a bar.
+
+    However variance is what separates them, because these charts are grey step wedges
+    and colour bars: one component spans many levels, so its standard
+    deviation is large, while tissue is comparatively uniform in grey.
 
     Only components at least ``min_area_fraction`` of the largest are tested, so
-    small debris is not judged by a measure that is noisy at that size.
-
+    small debris is not judged by measures that are noisy at that size.
     """
     if max_extent > 1.0:
         return mask, 0
@@ -127,9 +133,11 @@ def drop_rectangular_components(mask: np.ndarray, max_extent: float,
         if not box:
             continue
         aspect = max(width / height, height / width)
-        # Both tests, not either: a compact section can score high on extent
-        # and an elongated one high on aspect, but only printed bars do both.
-        if area / box > max_extent and aspect > min_aspect:
+        if not (area / box > max_extent and aspect > min_aspect):
+            continue
+        # Shape says bar; only the grey levels inside can say print. Last,
+        # because it is the expensive test and most components never reach it.
+        if float(gray[labels == label].std()) > max_sd:
             printed.append(label)
 
     if len(printed) == count - 1:
@@ -168,7 +176,9 @@ def tissue_mask(rgb: np.ndarray, pixel_size_um: float, params: CleanParams):
     """Binary tissue mask (0 or 255) plus the values estimated along the way."""
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
 
-    threshold = estimate_background_threshold(gray)
+    threshold = (estimate_background_threshold(gray)
+                 if params.background_threshold is None
+                 else int(params.background_threshold))
     _, coarse = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY_INV)
 
     # Blur then Otsu: the blur bridges gaps inside tissue so Otsu sees one
@@ -188,8 +198,8 @@ def tissue_mask(rgb: np.ndarray, pixel_size_um: float, params: CleanParams):
     # After the border pass, so a chart that both touches the edge and is
     # rectangular is only counted once.
     mask, printed = drop_rectangular_components(
-        mask, params.mask_max_extent, params.mask_min_aspect,
-        params.mask_extent_min_area_fraction)
+        mask, gray, params.mask_max_extent, params.mask_min_aspect,
+        params.mask_extent_min_area_fraction, params.mask_printed_max_sd)
 
     # Last, so the printed bars are gone before the size test runs and cannot
     # affect what counts as large.

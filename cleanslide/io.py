@@ -27,6 +27,11 @@ class Section:
     stain: str | None
     pixel_size_um: float
     staining: str | None = None
+    # From the sidecar's BackgroundThreshold, when it carries one: the grey
+    # level above which a pixel is slide. None means the section asked for it
+    # to be estimated, absent means it said nothing and the default applies.
+    background_threshold: int | None = None
+    declares_background_threshold: bool = False
 
     @property
     def name(self) -> str:
@@ -38,6 +43,27 @@ class Section:
 
 def _entities(filename: str) -> dict:
     return {m.group("key"): m.group("value") for m in _ENTITY.finditer(filename)}
+
+
+def read_background_threshold(meta: dict, where: str):
+    """``(value, declared)`` from a sidecar's optional BackgroundThreshold.
+
+    A section may carry the level its stain and scanner need, so a mixed
+    dataset can be cleaned in one run. ``"auto"`` asks for the per-section
+    estimate; a number fixes it. Absent, the caller's default applies.
+    """
+    if "BackgroundThreshold" not in meta:
+        return None, False
+    value = meta["BackgroundThreshold"]
+    if isinstance(value, str) and value.lower() == "auto":
+        return None, True
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{where}: BackgroundThreshold must be a number or "
+                         f'"auto", got {value!r}')
+    if not 0 <= value <= 255:
+        raise ValueError(f"{where}: BackgroundThreshold {value} is outside "
+                         "the 0-255 range of an 8-bit grey level")
+    return int(value), True
 
 
 def _stain_from(meta: dict) -> str | None:
@@ -103,8 +129,10 @@ def find_sections(bids_dir: str, participant_labels: list[str] | None = None,
                 continue
 
             entities = _entities(stem)
-            pixel_size_um, meta = read_pixel_size_um(
-                os.path.join(micr, stem + ".json"))
+            sidecar = os.path.join(micr, stem + ".json")
+            pixel_size_um, meta = read_pixel_size_um(sidecar)
+            threshold, declared = read_background_threshold(
+                meta, os.path.basename(sidecar))
             sections.append(Section(
                 path=os.path.join(micr, filename),
                 subject=entities.get("sub", label),
@@ -112,6 +140,8 @@ def find_sections(bids_dir: str, participant_labels: list[str] | None = None,
                 stain=entities.get("stain") or _stain_from(meta),
                 pixel_size_um=pixel_size_um,
                 staining=meta.get("SampleStaining"),
+                background_threshold=threshold,
+                declares_background_threshold=declared,
             ))
     return sections
 

@@ -117,6 +117,22 @@ def test_calibration_chart_is_dropped_from_the_mask(section_with_chart):
     assert info["mask_area_px"] < int((without > 0).sum())
 
 
+def gray_for(mask, *wedges):
+    """A grayscale to go with a synthetic mask: flat tissue, step-wedge bars.
+
+    The printed test needs grey levels as well as shape, because a chart is a
+    wedge spanning many levels while tissue is comparatively uniform. Each
+    wedge is an ``(x0, y0, x1, y1)`` box filled with a full black-to-white
+    ramp, which is what a calibration strip looks like.
+    """
+    gray = np.full(mask.shape, 235, np.uint8)
+    gray[mask > 0] = 120
+    for x0, y0, x1, y1 in wedges:
+        ramp = np.linspace(0, 255, x1 - x0, dtype=np.uint8)
+        gray[y0:y1, x0:x1] = np.tile(ramp, (y1 - y0, 1))
+    return gray
+
+
 def test_rectangular_component_is_dropped_but_irregular_tissue_is_kept():
     """Printed matter fills its bounding box; tissue does not. Measured on the
     affected section: brain 0.648, temporal lobes 0.51 and 0.57, chart 0.885."""
@@ -124,7 +140,9 @@ def test_rectangular_component_is_dropped_but_irregular_tissue_is_kept():
     cv2.ellipse(mask, (300, 180), (200, 140), 0, 0, 360, 255, -1)   # irregular
     cv2.rectangle(mask, (100, 420), (500, 520), 255, -1)            # printed bar
 
-    out, dropped = stages.drop_rectangular_components(mask, max_extent=0.80)
+    gray = gray_for(mask, (100, 420, 500, 520))
+
+    out, dropped = stages.drop_rectangular_components(mask, gray, max_extent=0.80)
 
     assert dropped == 1
     assert out[470, 300] == 0, "the rectangle is dropped"
@@ -140,7 +158,8 @@ def test_rectangular_component_is_dropped_even_when_it_is_the_largest():
     cv2.ellipse(mask, (600, 280), (140, 190), 0, 0, 360, 255, -1)
 
     areas = [int((mask[600:880, 50:850] > 0).sum())]
-    out, dropped = stages.drop_rectangular_components(mask, max_extent=0.80)
+    gray = gray_for(mask, (50, 600, 850, 880))
+    out, dropped = stages.drop_rectangular_components(mask, gray, max_extent=0.80)
 
     assert areas[0] > 0
     assert dropped == 1
@@ -154,8 +173,9 @@ def test_mask_is_never_emptied_by_the_rectangularity_test():
     mask = np.zeros((600, 600), np.uint8)
     cv2.rectangle(mask, (50, 50), (550, 250), 255, -1)
     cv2.rectangle(mask, (50, 350), (400, 500), 255, -1)
+    gray = gray_for(mask, (50, 50, 550, 250), (50, 350, 400, 500))
 
-    out, dropped = stages.drop_rectangular_components(mask, max_extent=0.80)
+    out, dropped = stages.drop_rectangular_components(mask, gray, max_extent=0.80)
 
     assert dropped == 1, "only the smaller one goes"
     assert out[150, 300] == 255, "the largest is kept as a fallback"
@@ -169,7 +189,10 @@ def test_elongation_is_required_as_well_as_rectangularity():
     cv2.rectangle(mask, (40, 100), (860, 290), 255, -1)    # extent 1.0, aspect 4.3
     cv2.rectangle(mask, (300, 450), (700, 820), 255, -1)   # extent 1.0, aspect 1.08
 
-    out, dropped = stages.drop_rectangular_components(mask, max_extent=0.70,
+    gray = gray_for(mask, (40, 100, 860, 290), (300, 450, 700, 820))
+
+    out, dropped = stages.drop_rectangular_components(mask, gray,
+                                                      max_extent=0.70,
                                                       min_aspect=1.7)
     assert dropped == 1
     assert out[200, 450] == 0, "the elongated bar goes"
@@ -211,7 +234,8 @@ def test_rectangularity_filter_can_be_disabled():
     cv2.ellipse(mask, (300, 180), (200, 140), 0, 0, 360, 255, -1)
     cv2.rectangle(mask, (100, 420), (500, 520), 255, -1)
 
-    out, dropped = stages.drop_rectangular_components(mask, max_extent=1.5)
+    gray = gray_for(mask, (100, 420, 500, 520))
+    out, dropped = stages.drop_rectangular_components(mask, gray, max_extent=1.5)
     assert dropped == 0 and np.array_equal(out, mask)
 
 
@@ -221,8 +245,9 @@ def test_small_debris_is_not_judged_on_rectangularity():
     mask = np.zeros((600, 600), np.uint8)
     cv2.ellipse(mask, (300, 300), (200, 150), 0, 0, 360, 255, -1)
     cv2.rectangle(mask, (10, 10), (18, 18), 255, -1)                # tiny square
+    gray = gray_for(mask, (10, 10, 18, 18))
 
-    out, dropped = stages.drop_rectangular_components(mask, max_extent=0.80)
+    out, dropped = stages.drop_rectangular_components(mask, gray, max_extent=0.80)
     assert dropped == 0, "below the area fraction, so not tested"
     assert out[14, 14] == 255
 

@@ -13,6 +13,13 @@ class CleanParams:
     ``CleanParams(bubble_max_diameter_um=6000)``."""
 
     # ── Tissue mask ──────────────────────────────────────────────────────────
+    # Grey level above which a pixel is slide rather than tissue. A fixed level
+    # gives a tighter mask than the estimate does, but it only holds for a
+    # given scanner: measured backgrounds across two datasets run from 241 to
+    # 254, and a level well below a section's own background starts taking the
+    # tissue with it. Set to None to estimate it per section instead, which is
+    # what a section whose scale or illumination differs will need.
+    background_threshold: int | None = 240
     # Smoothing applied to the coarse foreground before Otsu. Large on purpose:
     # it is bridging gaps across tissue, not preserving detail.
     mask_blur_um: float = 1200.0
@@ -31,6 +38,12 @@ class CleanParams:
     # 1.0 to disable.
     mask_max_extent: float = 0.70
     mask_min_aspect: float = 1.7
+    # And the grey levels inside must vary more than tissue ever does. Shape
+    # alone deleted whole brain sections: a section cut as a long cortical
+    # strip is geometrically a bar, and two such strips were discarded over
+    # 0.006 of extent. These charts are step wedges and colour bars, so one
+    # component spans many grey levels while tissue is comparatively uniform.
+    mask_printed_max_sd: float = 45.0
     # Only components at least this fraction of the largest are tested for
     # rectangularity, so ordinary small debris is judged on its own terms.
     mask_extent_min_area_fraction: float = 0.05
