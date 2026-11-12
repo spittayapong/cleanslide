@@ -70,6 +70,7 @@ What the pipeline reads, and from where:
 | image | a file ending `_BF`, with a `<same stem>.json` beside it | yes |
 | **pixel size** | sidecar `PixelSize` + `PixelSizeUnits` | **yes — no default** |
 | stain | `stain-<label>` entity, and sidecar `SampleStaining` | no — both optional |
+| background threshold | sidecar `BackgroundThreshold` | no — see [The background threshold](#the-background-threshold) |
 
 The stain is read from both places and required in neither. The label is
 copied to the output filename and sidecar, but no stage reads it, so the same
@@ -112,6 +113,39 @@ Per section, in order:
 | `suppress_folds` | tissue folds and thin bright laminae, via grayscale opening *(off by default)* |
 | `enhance` | CLAHE inside the mask, or a sigmoid contrast curve |
 
+### The background threshold
+
+`tissue_mask` opens by splitting glass from tissue at a single grey level:
+every pixel brighter than it is slide. Everything after that — the Otsu pass,
+the component filters, the crop — works on that split, so this one number
+decides what the rest of the pipeline ever sees as tissue.
+
+The default is a fixed **240**. A fixed level gives a tighter mask than estimating one per section.
+
+The alternative is `auto`, which reads the level off each section's own
+histogram: take the dominant bright peak, walk down from its mode until the
+counts fall to a tenth of the peak, and cut at that foot of the background
+distribution. Use it for a scanner this was not tuned on, or when illumination
+drifts between sections.
+
+| Set it | How |
+|---|---|
+| for a whole run | `--background-threshold 240`, or `--background-threshold auto` |
+| per section | `"BackgroundThreshold": 243` — or `"auto"` — in that section's input sidecar |
+| not at all | the default of 240 applies |
+
+The command line wins over a sidecar, and a sidecar over the default, so a
+mixed dataset can carry its own level per section and still be overridden in
+one run.
+
+However it was set, the value actually used is written to the output sidecar as
+`Measurements.background_threshold`, and the stage QC panel prints it under the
+images.
+
+Getting it wrong **does not raise an error**. A level well below a section's own
+background eats into the tissue; one above it pulls glass in. Both run to
+completion, so check the mask in the QC panel after you change it.
+
 ## Usage
 
 A BIDS App, so the three positional arguments are the convention:
@@ -129,6 +163,8 @@ Options:
 | `--qc-dir DIR` | where panels go; default `<output_dir>/qc` |
 | `--enhance {clahe,sigmoid}` | intensity stage, default `clahe` |
 | `--suppress-folds` | delete bright structures narrower than the fold size; intended for cerebellar sections |
+| `--background-threshold N` | grey level above which a pixel is slide, or `auto` to estimate it per section; overrides the sidecars (default: 240) |
+| `--min-component-mm2 MM2` | drop mask components smaller than this; lower it for genuinely detached tissue, `0` keeps everything (default: 100.0) |
 
 For example, two subjects with QC:
 
@@ -166,10 +202,12 @@ reader should prefer the sidecar.
 `--qc` writes two PNGs per section:
 
 - `<section>_outputs.png` — the three outputs side by side
-- `<section>_qc.png` — every stage in order
+- `<section>_qc.png` — the input section first, then every stage in order
 
-The stage panel is how you answer "is the mask right on my data?", which is the
-first question a new dataset raises. Look at it before trusting a batch run.
+The stage panel leads with the section as it arrived — uncropped and unmasked —
+so every panel after it is read as a change to something visible. It is how you
+answer "is the mask right on my data?", which is the first question a new
+dataset raises. Look at it before trusting a batch run.
 [`notebook/demo_cleaning_one_section.ipynb`](notebook/demo_cleaning_one_section.ipynb)
 walks through the same thing interactively on one section.
 
