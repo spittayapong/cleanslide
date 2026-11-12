@@ -77,6 +77,14 @@ def clean_section(rgb: np.ndarray, pixel_size_um: float,
         if keep_stages:
             kept[name] = image.copy()
 
+    # The section as it arrived, so the QC panel opens on what went in: every
+    # later panel is a change to this, and the crop below means the stage
+    # images are no longer the same frame. Kept by reference, not copied — no
+    # stage writes into its input, they all return new arrays, and at full
+    # section size a copy here would be the largest allocation in the run.
+    if keep_stages:
+        kept["input"] = rgb
+
     mask, mask_info = stages.tissue_mask(rgb, pixel_size_um, params)
     info.update(mask_info)
 

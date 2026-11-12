@@ -9,6 +9,15 @@ import numpy as np
 
 from .pipeline import STAGE_ORDER
 
+# The raw section leads, then the stages in the order they ran. "input" is not
+# a stage, which is why it is not in STAGE_ORDER; it is the reference the rest
+# of the panel is read against.
+#
+# Public, with PANEL_CAPTIONS below: the demo notebook lays out the same panel
+# by hand, and anything that has to agree with stage_panel should read the
+# order and the labels from here rather than keep its own copy to drift.
+PANEL_ORDER = ("input", *STAGE_ORDER)
+
 QC_EXTRA_HINT = ("the QC panel needs matplotlib, which is not part of the core "
                  "install: pip install 'cleanslide[qc]'")
 
@@ -28,7 +37,8 @@ def _pyplot():
     import matplotlib.pyplot as plt
     return plt
 
-_CAPTIONS = {
+PANEL_CAPTIONS = {
+    "input": "input section\n(before mask and crop)",
     "tissue_mask": "tissue mask",
     "remove_bubbles": "bubbles inpainted (RGB)",
     "smooth_mask": "mask with its edge smoothed",
@@ -103,7 +113,7 @@ def stage_panel(result, title: str, out_path: str) -> str:
         raise ValueError("no intermediates; run clean_section(keep_stages=True)")
 
     plt = _pyplot()
-    present = [name for name in STAGE_ORDER if name in result.intermediates]
+    present = [name for name in PANEL_ORDER if name in result.intermediates]
     columns = min(4, len(present))
     rows = (len(present) + columns - 1) // columns
 
@@ -116,7 +126,7 @@ def stage_panel(result, title: str, out_path: str) -> str:
         axis.imshow(image, cmap=None if image.ndim == 3 else "gray",
                     vmin=None if image.ndim == 3 else 0,
                     vmax=None if image.ndim == 3 else 255)
-        axis.set_title(_CAPTIONS.get(name, name), fontsize=9)
+        axis.set_title(PANEL_CAPTIONS.get(name, name), fontsize=9)
         axis.set_xticks([])
         axis.set_yticks([])
 

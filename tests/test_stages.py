@@ -436,6 +436,31 @@ def test_mask_edge_smoothing_can_be_disabled():
     assert np.array_equal(stages.smooth_mask_edge(mask, PIXEL_SIZE_UM, 0.0), mask)
 
 
+def test_kept_stages_open_with_the_untouched_input(section):
+    """The QC panel leads with the section as it arrived.
+
+    Uncropped, unmasked and identical to what was passed in, so the panels
+    after it can be read as changes to a visible starting point.
+    """
+    from cleanslide import clean_section
+    from cleanslide.qc import PANEL_ORDER
+
+    result = clean_section(section, PIXEL_SIZE_UM, keep_stages=True)
+
+    assert next(iter(result.intermediates)) == "input"
+    assert PANEL_ORDER[0] == "input"
+    assert np.array_equal(result.intermediates["input"], section)
+    # It is the source frame, not a stage output: the rest are cropped.
+    assert result.intermediates["input"].shape[:2] == section.shape[:2]
+    assert result.intermediates["tissue_mask"].shape < section.shape[:2]
+
+
+def test_input_is_not_kept_without_keep_stages(section):
+    from cleanslide import clean_section
+
+    assert clean_section(section, PIXEL_SIZE_UM).intermediates == {}
+
+
 def test_no_dust_stage_exists():
     """Dust removal was removed: it inpainted 5-6% of the tissue and the loss
     was visible in the middle of sections."""
